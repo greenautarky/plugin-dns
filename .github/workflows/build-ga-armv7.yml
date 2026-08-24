@@ -96,8 +96,12 @@ jobs:
           print(f"results={total_results} counts={counts}")
           if total_results == 0:
               raise SystemExit("COVERAGE ZERO - a scan that inspected nothing is a failure, not a pass")
-          # Budget = measured at fork time (C4/H69). Gate against regression, not zero.
-          if counts.get("CRITICAL", 0) > 4 or counts.get("HIGH", 0) > 75:
+          # Budget = measured at fork time ON THIS GATE'S SCAN BASIS (full trivy
+          # incl. gobinary: C7/H124 — the local pre-scan used a narrower basis,
+          # first run proved the difference). Gate against regression, not zero.
+          # The load lives in CoreDNS 1.11.4's Go deps — bumping CoreDNS is the
+          # tracked follow-up, not a budget excuse.
+          if counts.get("CRITICAL", 0) > 7 or counts.get("HIGH", 0) > 124:
               raise SystemExit(f"CVE budget exceeded: {counts}")
           PY
 
