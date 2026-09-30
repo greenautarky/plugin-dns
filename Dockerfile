@@ -50,6 +50,7 @@ RUN \
 
 FROM ${BUILD_FROM}
 
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 ARG BUILD_ARCH
 
 # The armv7 base image is no longer rebuilt upstream, so its Alpine packages
