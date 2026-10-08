@@ -26,9 +26,9 @@ on:
     branches: [ga-armv7]
 
 env:
-  PUBLISH_VERSION: "2025.08.2"
-  UPSTREAM_VERSION: "2025.08.0"
-  COREDNS_VERSION: "1.11.4"
+  PUBLISH_VERSION: "2026.09.1"
+  UPSTREAM_VERSION: "2026.09.0"
+  COREDNS_VERSION: "1.14.7"
   # Digest-pinned: :3.22 is a floating tag that has already moved once
   # (rule 61 — two sources agreeing by luck; pin removes the second source).
   BUILD_FROM: "ghcr.io/home-assistant/armv7-base:3.22@sha256:ae2b8be31fee7bd01078d5ca51e7c48aa323ccbaca8085420a416e354b101246"
@@ -70,6 +70,25 @@ jobs:
             --label ga.upstream.version="${UPSTREAM_VERSION}" \
             -t "${IMAGE}:${PUBLISH_VERSION}" .
 
+      - name: Prove - the binary is the pinned CoreDNS, built for linux/arm
+        run: |
+          out=$(docker run --rm --platform linux/arm/v7 --entrypoint /usr/bin/coredns \
+            "${IMAGE}:${PUBLISH_VERSION}" -version)
+          echo "$out"
+          echo "$out" | grep -qx "CoreDNS-${COREDNS_VERSION}" \
+            || { echo "::error::binary is not CoreDNS-${COREDNS_VERSION}"; exit 1; }
+          echo "$out" | grep -q "linux/arm," \
+            || { echo "::error::binary is not linux/arm"; exit 1; }
+          plugins=$(docker run --rm --platform linux/arm/v7 --entrypoint /usr/bin/coredns \
+            "${IMAGE}:${PUBLISH_VERSION}" -plugins)
+          # Every plugin the rendered Corefile uses must be compiled in.
+          # (CoreDNS >= 1.12 prints bare names; 1.11 printed "  dns.<name>".)
+          for p in log errors loop debug hosts template mdns forward fallback cache; do
+            echo "$plugins" | grep -qxE "(  dns\.)?$p" \
+              || { echo "::error::plugin dns.$p missing from the binary"; echo "$plugins"; exit 1; }
+          done
+          echo "all 10 Corefile plugins present"
+
       - name: Smoke - /init boot, no entrypoint override (the exec-bit class)
         run: |
           mkdir -p /tmp/dnscfg
@@ -86,6 +105,53 @@ jobs:
           [ "$state" = "running" ] || { echo "::error::container not running"; exit 1; }
           docker exec smoke sh -c 'pgrep coredns >/dev/null' || { echo "::error::coredns not running under s6"; exit 1; }
           docker rm -f smoke
+
+      - name: Prove - the tempio-rendered Corefile parses and answers (two option sets)
+        run: |
+          # The Supervisor writes coredns.json and /config/hosts; corefile.sh renders
+          # /etc/corefile with tempio and falls back to the static file on failure.
+          # Assert the RENDERED file is what runs, that CoreDNS parsed it, and that it
+          # answers from the hosts plugin. A user-defined network, like the
+          # Supervisor's "hassio" network, so Docker's embedded DNS sits behind
+          # 127.0.0.11 (the default when no locals are set); on the default bridge
+          # CoreDNS itself would own 127.0.0.11:53 and loop correctly fires.
+          docker network create dnsproof >/dev/null
+          run_case() {
+            name=$1; json=$2; want=$3
+            dir=/tmp/dnscase-$name; mkdir -p "$dir"
+            echo "$json" > "$dir/coredns.json"
+            printf '172.30.32.2 supervisor supervisor.local.hass.io\n' > "$dir/hosts"
+            docker run -d --name "dns-$name" --platform linux/arm/v7 --network dnsproof \
+              -v "$dir:/config" "${IMAGE}:${PUBLISH_VERSION}"
+            sleep 20
+            logs=$(docker logs "dns-$name" 2>&1)
+            echo "----- $name: logs"; echo "$logs" | tail -25
+            echo "----- $name: /etc/corefile"; docker exec "dns-$name" cat /etc/corefile
+            [ "$(docker inspect "dns-$name" --format '{{.State.Status}}')" = running ] \
+              || { echo "::error::$name: container not running"; return 1; }
+            if echo "$logs" | grep -q "Corefile fails to generate"; then
+              echo "::error::$name: tempio render failed, static fallback corefile in use"; return 1
+            fi
+            if echo "$logs" | grep -qiE "\[FATAL\]|panic|plugin/loop: Loop|Error during parsing"; then
+              echo "::error::$name: CoreDNS fatal/parse/loop error"; return 1
+            fi
+            echo "$logs" | grep -q "CoreDNS-${COREDNS_VERSION}" \
+              || { echo "::error::$name: CoreDNS-${COREDNS_VERSION} did not report startup"; return 1; }
+            docker exec "dns-$name" grep -q -- "$want" /etc/corefile \
+              || { echo "::error::$name: rendered corefile lacks '$want'"; return 1; }
+            ans=$(docker exec "dns-$name" nslookup supervisor.local.hass.io 127.0.0.1 2>&1)
+            echo "$ans"
+            echo "$ans" | grep -q "172.30.32.2" \
+              || { echo "::error::$name: hosts record not answered"; return 1; }
+            docker rm -f "dns-$name" >/dev/null
+          }
+          run_case default \
+            '{"servers":["dns://1.1.1.1"],"locals":["dns://1.0.0.1"],"debug":false,"fallback":true}' \
+            'fallback REFUSED,SERVFAIL,NXDOMAIN'
+          run_case debug \
+            '{"servers":["dns://1.1.1.1"],"locals":[],"debug":true,"fallback":false}' \
+            'dns://127.0.0.11'
+          echo "both rendered Corefiles parsed and answered"
 
       - name: CVE gate (fail closed on zero coverage, budget-pinned)
         run: |
@@ -106,8 +172,8 @@ jobs:
           # Budget = measured at fork time ON THIS GATE'S SCAN BASIS (full trivy
           # incl. gobinary: C7/H124 — the local pre-scan used a narrower basis,
           # first run proved the difference). Gate against regression, not zero.
-          # The load lives in CoreDNS 1.11.4's Go deps — bumping CoreDNS is the
-          # tracked follow-up, not a budget excuse.
+          # The fork-time load lived in CoreDNS 1.11.4's Go deps; 2026.09.1 moves
+          # to CoreDNS 1.14.7. The budget stays a regression ceiling.
           if counts.get("CRITICAL", 0) > 7 or counts.get("HIGH", 0) > 124:
               raise SystemExit(f"CVE budget exceeded: {counts}")
           PY
